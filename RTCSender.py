@@ -13,8 +13,11 @@ from aiortc import (
     RTCConfiguration,
     RTCIceServer,
     VideoStreamTrack,
-    RTCSessionDescription, RTCDataChannel,
+    RTCSessionDescription,
+    RTCDataChannel,
 )
+
+from ConfigClient import load_ice_servers
 
 # ==============================
 # 設定 logging，方便看問題
@@ -23,18 +26,9 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("RTCSender")
 
 # 你的 STUN/TURN（請確認 124.71.218.178:3478 真的可用）
-RTC_CONFIG = RTCConfiguration(
-    iceServers=[
-        RTCIceServer(urls=["stun:124.71.218.178:3478"]),
-        RTCIceServer(
-            urls=["turn:124.71.218.178:3478?transport=udp"],
-            username="webrtc",
-            credential="123456",
-        ),
-        # 建議加 google 的 stun 做備援
-        RTCIceServer(urls=["stun:stun.l.google.com:19302"]),
-    ]
-)
+ice_server_dicts = asyncio.run(load_ice_servers("http://127.0.0.1:8080"))
+print(ice_server_dicts)
+RTC_CONFIG = RTCConfiguration(iceServers=[RTCIceServer(**d) for d in ice_server_dicts])
 
 
 def create_ssl_context():
@@ -78,7 +72,11 @@ class RTCSender:
         self.mqtt_port = 8883
         self._running = False
 
-    def open(self, readCameraFunc: Callable[[], np.ndarray | None], readRTCFunc: Callable[[str | bytes], None]):
+    def open(
+        self,
+        readCameraFunc: Callable[[], np.ndarray | None],
+        readRTCFunc: Callable[[str | bytes], None],
+    ):
         """從同步程式碼啟動"""
         asyncio.create_task(self._run(readCameraFunc, readRTCFunc))
 
@@ -112,10 +110,15 @@ class RTCSender:
 
         return pc
 
-    async def _run(self, readCameraFunc: Callable[[], np.ndarray | None], readRTCFunc: Callable[[str | bytes], None]):
+    async def _run(
+        self,
+        readCameraFunc: Callable[[], np.ndarray | None],
+        readRTCFunc: Callable[[str | bytes], None],
+    ):
         self._running = True
 
         try:
+            ssl_ctx = create_ssl_context()
             pc = await self._create_peer_connection()
             logger.info("PeerConnection 已建立")
 
@@ -125,6 +128,41 @@ class RTCSender:
             logger.info("已加入 VideoTrack")
 
             await self._craete_data_channel(pc, readRTCFunc)
+
+            async def recv_answer_task():
+                # 收 answer（加上 timeout 避免永遠卡住）
+                answer_json_str = None
+                async with aiomqtt.Client(
+                    hostname=self.mqtt_hostname,
+                    port=self.mqtt_port,
+                    tls_context=ssl_ctx,
+                ) as client:
+                    await client.subscribe(self.topic_answer, qos=2)
+                    logger.info(f"已訂閱 {self.topic_answer}，等待 answer...")
+
+                    try:
+                        async with asyncio.timeout(25):  # 最多等 25 秒
+                            async for message in client.messages:
+                                answer_json_str = message.payload.decode()
+                                logger.info("收到 answer")
+                                break
+                    except asyncio.TimeoutError:
+                        logger.error("等待 answer 超時（25秒）")
+                        return
+
+                if not answer_json_str:
+                    logger.error("沒有收到 answer")
+                    return
+
+                answer_data = json.loads(answer_json_str)
+                await pc.setRemoteDescription(
+                    RTCSessionDescription(
+                        sdp=answer_data["sdp"], type=answer_data["type"]
+                    )
+                )
+                logger.info("Remote Description (answer) 已設定")
+
+            asyncio.create_task(recv_answer_task())
 
             # 產生 offer
             offer = await pc.createOffer()
@@ -136,13 +174,11 @@ class RTCSender:
                 "sdp": pc.localDescription.sdp,
             }
             offer_json = json.dumps(offer_dict)
-
             # 送 offer
-            ssl_ctx = create_ssl_context()
             async with aiomqtt.Client(
-                    hostname=self.mqtt_hostname,
-                    port=self.mqtt_port,
-                    tls_context=ssl_ctx,
+                hostname=self.mqtt_hostname,
+                port=self.mqtt_port,
+                tls_context=ssl_ctx,
             ) as client:
                 await client.publish(
                     self.topic_offer,
@@ -150,36 +186,6 @@ class RTCSender:
                     qos=2,  # offer
                 )
                 logger.info(f"Offer 已發送到 {self.topic_offer}")
-
-            # 收 answer（加上 timeout 避免永遠卡住）
-            answer_json_str = None
-            async with aiomqtt.Client(
-                    hostname=self.mqtt_hostname,
-                    port=self.mqtt_port,
-                    tls_context=ssl_ctx,
-            ) as client:
-                await client.subscribe(self.topic_answer, qos=2)
-                logger.info(f"已訂閱 {self.topic_answer}，等待 answer...")
-
-                try:
-                    async with asyncio.timeout(25):  # 最多等 25 秒
-                        async for message in client.messages:
-                            answer_json_str = message.payload.decode()
-                            logger.info("收到 answer")
-                            break
-                except asyncio.TimeoutError:
-                    logger.error("等待 answer 超時（25秒）")
-                    return
-
-            if not answer_json_str:
-                logger.error("沒有收到 answer")
-                return
-
-            answer_data = json.loads(answer_json_str)
-            await pc.setRemoteDescription(
-                RTCSessionDescription(sdp=answer_data["sdp"], type=answer_data["type"])
-            )
-            logger.info("Remote Description (answer) 已設定")
 
             # 保持連線，直到被外部關閉或 ICE 斷掉
             while self._running and pc.connectionState not in ("closed", "failed"):
@@ -194,8 +200,9 @@ class RTCSender:
                 self.pc = None
             logger.info("RTCSender 結束")
 
-    async def _craete_data_channel(self, pc: RTCPeerConnection,
-                                   readRTCFunc: Callable[[str | bytes], None]) -> RTCDataChannel:
+    async def _craete_data_channel(
+        self, pc: RTCPeerConnection, readRTCFunc: Callable[[str | bytes], None]
+    ) -> RTCDataChannel:
         dc = pc.createDataChannel("pos")
 
         @dc.on("open")
@@ -214,11 +221,9 @@ class RTCSender:
 if __name__ == "__main__":
     sender = RTCSender(mqtt_topic_prefix="user/aiwang23")
 
-
     # 假的讀取函數（請換成你真的來源，例如 OpenCV 的 cap.read()）
     def fake_read():
         return np.random.randint(0, 255, (480, 640, 3), dtype=np.uint8)
-
 
     sender.open(fake_read)
 
